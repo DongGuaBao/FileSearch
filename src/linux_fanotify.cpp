@@ -7,6 +7,8 @@
 #include <sys/fanotify.h>
 #include <sys/vfs.h>
 #include <unistd.h>
+#include <poll.h>
+#include <stdexcept>
 
 namespace fsengine {
 namespace {
@@ -20,18 +22,24 @@ std::string Key(const void* fsid, int type, const unsigned char* bytes, unsigned
     return key;
 }
 }
-LinuxFanotify::~LinuxFanotify() { if (fd_ >= 0) close(fd_); }
+LinuxFanotify::~LinuxFanotify() {
+    stopping_ = true;
+    if (reader_.joinable()) reader_.join();
+    if (fd_ >= 0) close(fd_);
+}
 bool LinuxFanotify::Open(const std::string& path, std::string& error) {
     if (fd_ >= 0) { error = "fanotify group already open"; return false; }
     fd_ = fanotify_init(FAN_CLASS_NOTIF | FAN_CLOEXEC | FAN_NONBLOCK |
         FAN_REPORT_FID | FAN_REPORT_DIR_FID | FAN_REPORT_NAME | FAN_REPORT_TARGET_FID, O_RDONLY | O_CLOEXEC);
     if (fd_ < 0) { error = std::strerror(errno); return false; }
     if (!AddFilesystem(path, error)) { close(fd_); fd_ = -1; return false; }
+    try { reader_ = std::thread([this] { Collect(); }); }
+    catch (const std::exception& failure) { error=failure.what();close(fd_);fd_=-1;return false; }
     return true;
 }
 bool LinuxFanotify::AddFilesystem(const std::string& path, std::string& error) {
     const std::uint64_t mask = FAN_CREATE | FAN_DELETE | FAN_RENAME |
-        FAN_CLOSE_WRITE | FAN_ATTRIB | FAN_ONDIR;
+        FAN_MODIFY | FAN_CLOSE_WRITE | FAN_ATTRIB | FAN_ONDIR;
     if (fanotify_mark(fd_, FAN_MARK_ADD | FAN_MARK_FILESYSTEM, mask, AT_FDCWD, path.c_str()) < 0) {
         const int failure = errno;
         // FID-mode fanotify rejects a Btrfs subvolume path with EXDEV because
@@ -118,6 +126,7 @@ bool LinuxFanotify::DecodeBuffer(const void* data, std::size_t size,
                 error = "invalid fanotify metadata"; return false;
             }
             LinuxNotification event;
+            event.process_id = metadata->pid;
             event.mask = metadata->mask;
             event.overflow = (metadata->mask & FAN_Q_OVERFLOW) != 0;
             const std::size_t end = offset + metadata->event_len;
@@ -188,7 +197,7 @@ bool LinuxFanotify::DecodeBuffer(const void* data, std::size_t size,
         error.clear();
         return true;
 }
-bool LinuxFanotify::Read(std::vector<LinuxNotification>& events, std::string& error) {
+bool LinuxFanotify::Drain(std::vector<LinuxNotification>& events, std::string& error) {
     alignas(fanotify_event_metadata) unsigned char buffer[65536];
     for (unsigned batch = 0; batch < 16; ++batch) {
         const ssize_t count = read(fd_, buffer, sizeof(buffer));
@@ -202,4 +211,55 @@ bool LinuxFanotify::Read(std::vector<LinuxNotification>& events, std::string& er
     }
     return true;
 }
+void LinuxNotificationBuffer::Push(LinuxNotification event) {
+    if (overflow_) return;
+    if (event.overflow) {
+        const bool local = !event.overflow || event.userspace_overflow;
+        pending_.clear(); metadata_.clear(); overflow_=true;
+        LinuxNotification marker;marker.overflow=true;marker.userspace_overflow=local;
+        pending_.push_back(std::move(marker));return;
+    }
+    constexpr std::uint64_t metadata_mask=FAN_MODIFY|FAN_CLOSE_WRITE|FAN_ATTRIB;
+    if ((event.mask&metadata_mask) && !(event.mask&~(metadata_mask|FAN_ONDIR))) {
+        const auto key=std::make_tuple(event.directory_handle,event.name,event.object_handle);
+        auto found=metadata_.find(key);
+        if(found!=metadata_.end()) {pending_[found->second].mask|=event.mask;return;}
+        metadata_[key]=pending_.size();
+    } else metadata_.clear(); // Never merge metadata across rename/create/delete.
+    if (pending_.size() >= limit_) {
+        LinuxNotification marker;marker.overflow=true;marker.userspace_overflow=true;
+        Push(std::move(marker));return;
+    }
+    pending_.push_back(std::move(event));
+}
+std::vector<LinuxNotification> LinuxNotificationBuffer::Take() {
+    std::vector<LinuxNotification> result;
+    pending_.swap(result);metadata_.clear();overflow_=false;return result;
+}
+void LinuxFanotify::Collect() {
+    try {
+        while (!stopping_) {
+            pollfd notification{fd_,POLLIN,0};
+            const int result=poll(&notification,1,20);
+            if(result<0) {if(errno==EINTR)continue;throw std::runtime_error(std::strerror(errno));}
+            if(!result)continue;
+            if(notification.revents&(POLLERR|POLLHUP|POLLNVAL))throw std::runtime_error("fanotify descriptor unavailable");
+            std::vector<LinuxNotification> batch;std::string error;
+            if(!Drain(batch,error))throw std::runtime_error(error);
+            std::lock_guard lock(mutex_);
+            for(auto& event:batch) {
+                if(!event.overflow && ignored_process_>0 && event.process_id==ignored_process_)continue;
+                pending_.Push(std::move(event));
+            }
+        }
+    } catch(const std::exception& failure) { std::lock_guard lock(mutex_);reader_error_=failure.what(); }
+}
+bool LinuxFanotify::Read(std::vector<LinuxNotification>& events,std::string& error) {
+    std::lock_guard lock(mutex_);
+    if(!reader_error_.empty()){error=reader_error_;return false;}
+    auto batch=pending_.Take();
+    events.insert(events.end(),std::make_move_iterator(batch.begin()),std::make_move_iterator(batch.end()));
+    error.clear();return true;
+}
+
 }

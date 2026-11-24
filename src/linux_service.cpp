@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <fcntl.h>
 #include <iostream>
+#include <fstream>
 #include <memory>
 #include <set>
 #include <poll.h>
@@ -17,6 +18,7 @@
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <thread>
+#include <cstdlib>
 #include <unistd.h>
 
 using Json = nlohmann::json;
@@ -122,7 +124,14 @@ Json EntryJson(const fsengine::LinuxScanEntry& entry) {
     return {{"name", fsengine::WideToUtf8(fsengine::Utf8ToWide(entry.name))},
         {"path", fsengine::WideToUtf8(fsengine::Utf8ToWide(entry.path))},
         {"name_bytes_hex", Hex(entry.name)}, {"path_bytes_hex", Hex(entry.path)},
-        {"id", entry.id}, {"is_directory", entry.directory}, {"is_symlink", entry.symlink}};
+        {"id", entry.id}, {"is_directory", entry.directory}, {"is_symlink", entry.symlink},
+        {"size_known", entry.metadata_known}, {"logical_size", entry.logical_size}, {"allocated_size", entry.allocated_size},
+        {"modified_ns", entry.modified_ns}, {"checked_at_ms", entry.checked_at_ms}};
+}
+Json SearchEntryJson(const fsengine::LinuxScanEntry& entry, bool compact) {
+    if (!compact) return EntryJson(entry);
+    return {{"name", fsengine::WideToUtf8(fsengine::Utf8ToWide(entry.name))}, {"path", fsengine::WideToUtf8(fsengine::Utf8ToWide(entry.path))},
+        {"is_directory",entry.directory},{"is_symlink",entry.symlink},{"size_known",entry.metadata_known},{"logical_size",entry.logical_size},{"modified_ns",entry.modified_ns}};
 }
 std::size_t PageSize(const Json& request) {
     if (!request.contains("page_size")) return 256;
@@ -169,7 +178,9 @@ void SnapshotClient(int fd, const Json& request, fsengine::LinuxCatalog& catalog
         if (next.contains("page_size")) page_size = PageSize(next);
     }
 }
-void Client(int fd, bool subscription, fsengine::LinuxCatalog& catalog, std::atomic<unsigned>& clients) {
+void Client(int fd, bool subscription, fsengine::LinuxCatalog& catalog, std::atomic<unsigned>& clients,
+    const std::atomic<bool>& initialized, fsengine::LinuxQueryCache& cache, const std::string& database,
+    const std::string& scan_root, const std::string& state_root, const std::vector<fsengine::LinuxMount>& mounts) {
     struct Guard { int fd; std::atomic<unsigned>& count; ~Guard() { close(fd); --count; } } guard{fd, clients};
     timeval timeout{2, 0};
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
@@ -178,11 +189,52 @@ void Client(int fd, bool subscription, fsengine::LinuxCatalog& catalog, std::ato
         const Json request = Receive(fd);
         if (!subscription) {
             const std::string command = request.value("command", "search");
+            if (!initialized.load() || (command == "search" && !catalog.SearchReady()) || (command == "directory_sizes" && !catalog.Ready())) {
+                if (command == "status") { Send(fd, {{"ok",true},{"ready",false},{"search_ready",false},{"initializing",true},{"validating",true}}); return; }
+                if (command == "directory_sizes") {
+                    const auto paths=request.at("paths").get<std::vector<std::string>>();
+                    if(paths.size()>128)throw std::runtime_error("too many paths");
+                    for(const auto& path:paths)if(path.empty()||path.front()!='/'||path.find('\0')!=std::string::npos||std::filesystem::path(path).lexically_normal().string()!=path)throw std::runtime_error("invalid path");
+                    const auto values=cache.Read(paths);Json entries=Json::array();
+                    for(std::size_t i=0;i<paths.size();++i){
+                        const bool allowed=WithinScope(paths[i],scan_root)&&!WithinScope(paths[i],state_root)&&fsengine::IsLinuxCatalogPath(mounts,paths[i]);
+                        Json item{{"path",paths[i]},{"state",allowed?"calculating":"excluded"},{"complete",false},{"logical_bytes",nullptr}};
+                        if(allowed&&values[i].value){const auto& value=*values[i].value;item["state"]=values[i].complete?"stale":"partial";item["complete"]=values[i].complete;item["logical_bytes"]=value.logical_bytes;item["allocated_bytes"]=value.allocated_bytes;item["files"]=value.files;item["unknown"]=value.unknown;item["updated_at_ms"]=value.checked_at_ms;}
+                        entries.push_back(std::move(item));
+                    }Send(fd,{{"ok",true},{"initializing",true},{"entries",std::move(entries)}});return;
+                }
+                if (command == "search") {
+                    const auto query=request.value("query",std::string{});if(query.empty()||query.size()>1024)throw std::runtime_error("query must contain 1–1024 bytes");
+                    auto scope=RequestScope(request);if(scope.empty())scope=scan_root;
+                    if(!WithinScope(scope,scan_root)||WithinScope(scope,state_root)||!fsengine::IsLinuxCatalogPath(mounts,scope))throw std::runtime_error("excluded search scope");
+                    bool interrupted=false;Json results=Json::array();
+                    try { for(const auto& entry:fsengine::SearchLinuxStored(database,scan_root,scope,query,std::min<std::size_t>(request.value("max_results",std::size_t{50}),10000),interrupted)) {
+                        if(!WithinScope(entry.path,state_root)&&fsengine::IsLinuxCatalogPath(mounts,entry.path))results.push_back(SearchEntryJson(entry, request.value("compact", false)));
+                    }} catch(const std::exception&) { interrupted=true; }
+                    Send(fd,{{"ok",true},{"initializing",true},{"stale",true},{"partial",interrupted},{"results",std::move(results)}});return;
+                }
+                throw fsengine::LinuxCatalogNotReady();
+            }
             if (command == "status") { Send(fd, {{"ok", true}, {"ready", catalog.Ready()},
                 {"search_ready", catalog.SearchReady()}, {"validating", !catalog.Ready()},
                 {"scan_retries", catalog.ScanRetryCount()},
                 {"fanotify_overflows", catalog.OverflowCount()}, {"recovered_database", catalog.RecoveredDatabase()},
                 {"position", Position(catalog.Position())}}); return; }
+            if (command == "directory_sizes") {
+                const auto& paths = request.at("paths");
+                if (!paths.is_array() || paths.size() > 128) throw std::runtime_error("paths must contain at most 128 strings");
+                Json entries = Json::array();
+                for (const auto& item : catalog.DirectorySizes(paths.get<std::vector<std::string>>())) {
+                    Json entry{{"path", item.path}, {"state", item.state}, {"complete", item.size && !item.size->unknown && item.state != "partial" && item.state != "calculating"}};
+                    if (item.size) {
+                        entry["logical_bytes"] = item.size->logical_bytes; entry["allocated_bytes"] = item.size->allocated_bytes;
+                        entry["files"] = item.size->files; entry["unknown"] = item.size->unknown;
+                        entry["updated_at_ms"] = item.size->checked_at_ms;
+                    } else entry["logical_bytes"] = nullptr;
+                    entries.push_back(std::move(entry));
+                }
+                Send(fd, {{"ok", true}, {"entries", std::move(entries)}}); return;
+            }
             if (command == "snapshot") { SnapshotClient(fd, request, catalog); return; }
             if (command != "search") throw std::runtime_error("unknown command");
             const std::string query = request.value("query", "");
@@ -197,10 +249,11 @@ void Client(int fd, bool subscription, fsengine::LinuxCatalog& catalog, std::ato
             const auto entries = catalog.Search(query, RequestScope(request),
                 std::min<std::size_t>(request.value("max_results", std::size_t{50}), 10000), phase, &stale);
             Json results = Json::array();
-            for (const auto& entry : entries) results.push_back(EntryJson(entry));
+            for (const auto& entry : entries) results.push_back(SearchEntryJson(entry, request.value("compact", false)));
             Send(fd, {{"ok", true}, {"stale", stale}, {"count", results.size()}, {"results", std::move(results)}});
             return;
         }
+        if (!initialized.load()) throw fsengine::LinuxCatalogNotReady();
         if (request.value("command", "") != "subscribe_changes" || request.value("version", 1) != 1)
             throw std::runtime_error("invalid subscription");
         const auto scope = RequestScope(request);
@@ -249,6 +302,14 @@ void Client(int fd, bool subscription, fsengine::LinuxCatalog& catalog, std::ato
     } catch (const std::exception& error) { Send(fd, {{"ok", false}, {"error", error.what()}}); }
 }
 }
+unsigned EnvironmentUnsigned(const char* name, unsigned fallback, unsigned maximum) {
+    const char* text = std::getenv(name);
+    if (!text || !*text) return fallback;
+    std::size_t consumed = 0;
+    const auto value = std::stoul(text, &consumed);
+    if (text[consumed] || value > maximum) throw std::runtime_error(std::string("invalid ") + name);
+    return static_cast<unsigned>(value);
+}
 int main(int argc, char** argv) {
     if (argc != 3) { std::cerr << "usage: FileSearchServiceLinux ROOT SOCKET_DIRECTORY\n"; return 2; }
     signal(SIGTERM, Signal); signal(SIGINT, Signal);
@@ -262,6 +323,10 @@ int main(int argc, char** argv) {
     std::string collector_error;
     fsengine::LinuxCatalog catalog;
     int result = 0;
+    std::atomic<bool> initialized{false};
+    std::unique_ptr<fsengine::LinuxQueryCache> query_cache;
+    std::string database, scan_root, state_root;
+    std::vector<fsengine::LinuxMount> boot_mounts;
     try {
         workers.reserve(32);
         std::string error;
@@ -279,18 +344,38 @@ int main(int argc, char** argv) {
             throw std::runtime_error("invalid service lock");
         if (flock(instance_lock, LOCK_EX | LOCK_NB) < 0)
             throw std::runtime_error("another service owns this IPC directory");
-        const auto database = (socket_directory / "catalog.db").string();
+        database = (socket_directory / "catalog.db").string();
+        scan_root=std::filesystem::path(argv[1]).lexically_normal().string();
+        while(scan_root.size()>1&&scan_root.back()=='/')scan_root.pop_back();
+        state_root=socket_directory.lexically_normal().string();
+        std::ifstream mount_input("/proc/self/mountinfo");boot_mounts=fsengine::ReadLinuxMounts(mount_input);
+        const auto size_database=(socket_directory / "directory-sizes.db").string();
+        struct stat size_state{};
+        if(lstat(size_database.c_str(),&size_state)==0&&(!S_ISREG(size_state.st_mode)||size_state.st_uid!=geteuid()||size_state.st_nlink!=1))throw std::runtime_error("invalid directory cache file");
+        query_cache=std::make_unique<fsengine::LinuxQueryCache>(size_database,scan_root);
+        catalog.SetQueryCache(query_cache.get());
+        catalog.SetIgnoredProcess(getpid());
         struct stat database_state{};
         if (lstat(database.c_str(), &database_state) == 0 &&
             (!S_ISREG(database_state.st_mode) || database_state.st_uid != geteuid() || database_state.st_nlink != 1))
             throw std::runtime_error("invalid catalog database file");
-        if (!catalog.Start(argv[1], error, database, true)) throw std::runtime_error(error);
+        fsengine::LinuxScanOptions scan_options;
+        scan_options.batch_entries = EnvironmentUnsigned("FILESEARCH_SCAN_BATCH", 512, 65536);
+        scan_options.pause_ms = EnvironmentUnsigned("FILESEARCH_SCAN_PAUSE_MS", 5, 1000);
+        scan_options.cancelled = [] { return stopping.load(); };
+        catalog.SetScanOptions(std::move(scan_options));
+        catalog.SetReconcileInterval(EnvironmentUnsigned("FILESEARCH_RECONCILE_SECONDS", 21600, 604800));
+
         search_path = (socket_directory / "search.sock").string(); events_path = (socket_directory / "events.sock").string();
         search = Listen(search_path); events = Listen(events_path);
         // Same service process, separate worker: scans must not block accepting
         // search/status clients. Only this worker owns fanotify and calls Pump.
         collector = std::thread([&]() {
             try {
+                std::cerr << "query sockets ready; loading catalog in background" << std::endl;
+                if (!catalog.Start(scan_root, collector_error, database, true)) { stopping=true; return; }
+                initialized=true;
+                std::cerr << "cached search index ready" << std::endl;
                 while (!stopping) {
                     if (!catalog.Pump(collector_error)) { stopping = true; return; }
                     pollfd notification{catalog.EventDescriptor(), POLLIN, 0};
@@ -315,7 +400,7 @@ int main(int argc, char** argv) {
                 auto finished = std::make_shared<std::atomic<bool>>(false);
                 try {
                     workers.push_back({std::thread([&, fd, subscription = i == 1, finished]() {
-                        Client(fd, subscription, catalog, clients);
+                        Client(fd, subscription, catalog, clients, initialized, *query_cache, database, scan_root, state_root, boot_mounts);
                         finished->store(true);
                     }), finished});
                 } catch (...) { close(fd); --clients; throw; }

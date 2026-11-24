@@ -36,7 +36,11 @@ LinuxScanEntry ReadEntry(sqlite3_stmt* statement) {
         static_cast<std::uint64_t>(sqlite3_column_int64(statement, 2)),
         static_cast<std::uint64_t>(sqlite3_column_int64(statement, 3)),
         sqlite3_column_int(statement, 4) != 0, sqlite3_column_int(statement, 5) != 0,
-        static_cast<std::uint64_t>(sqlite3_column_int64(statement, 6)), Bytes(statement, 7)};
+        static_cast<std::uint64_t>(sqlite3_column_int64(statement, 6)), Bytes(statement, 7),
+        static_cast<std::uint64_t>(sqlite3_column_int64(statement, 8)),
+        static_cast<std::uint64_t>(sqlite3_column_int64(statement, 9)),
+        sqlite3_column_int64(statement, 10), sqlite3_column_int64(statement, 11),
+        sqlite3_column_int(statement, 12) != 0, sqlite3_column_int(statement, 13) != 0};
 }
 }
 LinuxStoreSnapshot::~LinuxStoreSnapshot() {
@@ -78,7 +82,7 @@ std::unique_ptr<LinuxStoreSnapshot> LinuxStore::Snapshot(const std::string& scop
         Check(snapshot->db_, opened);
         sqlite3_busy_timeout(snapshot->db_, 2000);
         Exec(snapshot->db_, "BEGIN");
-        std::string sql = "SELECT path,name,inode,device,directory,symlink,entry_id,object_key FROM entries WHERE ";
+        std::string sql = "SELECT path,name,inode,device,directory,symlink,entry_id,object_key,logical_size,allocated_size,modified_ns,checked_at_ms,regular_file,metadata_known FROM entries WHERE ";
         const bool scoped = !scope.empty() && scope != "/";
         sql += scoped ? "(path>=?1 AND path<?3 AND (path=?1 OR path>=?2))" : "1";
         if (!files && !directories) sql += " AND 0";
@@ -119,6 +123,16 @@ bool LinuxStore::Open(const std::string& path, std::string& error) {
         }
         if (!has_id) Exec(db_, "ALTER TABLE entries ADD COLUMN entry_id INTEGER NOT NULL DEFAULT 0");
         if (!has_key) Exec(db_, "ALTER TABLE entries ADD COLUMN object_key BLOB NOT NULL DEFAULT X''");
+        // Additive migration: old catalogs remain readable, with unknown sizes.
+        for (const char* name : {"logical_size", "allocated_size", "modified_ns", "checked_at_ms", "regular_file", "metadata_known"}) {
+            bool exists = false;
+            auto columns = Prepare(db_, "PRAGMA table_info(entries)");
+            for (int code; (code = sqlite3_step(columns.get())) != SQLITE_DONE;) {
+                Check(db_, code); exists |= Bytes(columns.get(), 1) == name;
+            }
+            columns.reset();
+            if (!exists) Exec(db_, (std::string("ALTER TABLE entries ADD COLUMN ") + name + " INTEGER NOT NULL DEFAULT 0").c_str());
+        }
         Exec(db_, "CREATE TABLE IF NOT EXISTS catalog_metadata(key TEXT PRIMARY KEY, value BLOB NOT NULL);"
             "CREATE TABLE IF NOT EXISTS allocator(key TEXT PRIMARY KEY, value INTEGER NOT NULL);"
             "INSERT OR IGNORE INTO allocator SELECT 'next_id', COALESCE(MAX(entry_id),0)+1 FROM entries;"
@@ -196,9 +210,11 @@ bool LinuxStore::Commit(const std::vector<LinuxScanEntry>& entries, const std::v
             Check(db_, sqlite3_step(remove.get()));
             Check(db_, sqlite3_reset(remove.get()));
         }
-        auto insert = Prepare(db_, "INSERT INTO entries(path,name,inode,device,directory,symlink,entry_id,object_key) VALUES(?,?,?,?,?,?,?,?) "
+        auto insert = Prepare(db_, "INSERT INTO entries(path,name,inode,device,directory,symlink,entry_id,object_key,logical_size,allocated_size,modified_ns,checked_at_ms,regular_file,metadata_known) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
             "ON CONFLICT(path) DO UPDATE SET name=excluded.name,inode=excluded.inode,device=excluded.device,"
-            "directory=excluded.directory,symlink=excluded.symlink,entry_id=excluded.entry_id,object_key=excluded.object_key");
+            "directory=excluded.directory,symlink=excluded.symlink,entry_id=excluded.entry_id,object_key=excluded.object_key,"
+            "logical_size=excluded.logical_size,allocated_size=excluded.allocated_size,modified_ns=excluded.modified_ns,"
+            "checked_at_ms=excluded.checked_at_ms,regular_file=excluded.regular_file,metadata_known=excluded.metadata_known");
         std::uint64_t largest_id = 0;
         for (const auto& entry : entries) {
             if (entry.path.empty() || entry.path.front() != '/') throw std::runtime_error("catalog path must be absolute");
@@ -211,6 +227,12 @@ bool LinuxStore::Commit(const std::vector<LinuxScanEntry>& entries, const std::v
             Check(db_, sqlite3_bind_int(insert.get(), 6, entry.symlink));
             Check(db_, sqlite3_bind_int64(insert.get(), 7, static_cast<sqlite3_int64>(entry.id)));
             Bind(db_, insert.get(), 8, entry.object_key);
+            Check(db_, sqlite3_bind_int64(insert.get(), 9, static_cast<sqlite3_int64>(entry.logical_size)));
+            Check(db_, sqlite3_bind_int64(insert.get(), 10, static_cast<sqlite3_int64>(entry.allocated_size)));
+            Check(db_, sqlite3_bind_int64(insert.get(), 11, entry.modified_ns));
+            Check(db_, sqlite3_bind_int64(insert.get(), 12, entry.checked_at_ms));
+            Check(db_, sqlite3_bind_int(insert.get(), 13, entry.regular));
+            Check(db_, sqlite3_bind_int(insert.get(), 14, entry.metadata_known));
             Check(db_, sqlite3_step(insert.get())); Check(db_, sqlite3_reset(insert.get()));
         }
         if (largest_id) {
@@ -243,7 +265,7 @@ bool LinuxStore::Load(std::vector<LinuxScanEntry>& entries, std::string& error) 
     if (!db_) { error = "catalog store not open"; return false; }
     try {
         std::vector<LinuxScanEntry> next;
-        auto statement = Prepare(db_, "SELECT path,name,inode,device,directory,symlink,entry_id,object_key FROM entries ORDER BY path");
+        auto statement = Prepare(db_, "SELECT path,name,inode,device,directory,symlink,entry_id,object_key,logical_size,allocated_size,modified_ns,checked_at_ms,regular_file,metadata_known FROM entries ORDER BY path");
         for (;;) {
             int code = sqlite3_step(statement.get()); Check(db_, code);
             if (code == SQLITE_DONE) break;

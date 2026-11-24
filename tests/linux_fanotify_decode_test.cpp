@@ -47,7 +47,20 @@ static void Reject(const Bytes& bytes) {
     Require(!fsengine::LinuxFanotify::DecodeBuffer(bytes.data(), bytes.size(), events, error), "malformed buffer accepted");
     Require(!error.empty() && events.size() == 1 && events[0].name == "sentinel", "partial batch committed on error");
 }
+static void TestBufferedCollection() {
+    fsengine::LinuxNotificationBuffer queue(4);
+    fsengine::LinuxNotification write;write.mask=FAN_MODIFY;write.name="log";write.directory_handle="parent";write.object_handle="inode";
+    for(int i=0;i<100000;++i)queue.Push(write);
+    auto batch=queue.Take();Require(batch.size()==1&&!batch[0].overflow,"metadata burst must coalesce during a paused consumer");
+    queue.Push(write);fsengine::LinuxNotification rename;rename.mask=FAN_RENAME;rename.name="moved";queue.Push(rename);queue.Push(write);
+    batch=queue.Take();Require(batch.size()==3&&batch[1].mask==FAN_RENAME,"coalescing crossed a namespace operation");
+    for(int i=0;i<5;++i){auto created=rename;created.mask=FAN_CREATE;created.name=std::to_string(i);queue.Push(created);}
+    batch=queue.Take();Require(batch.size()==1&&batch[0].overflow&&batch[0].userspace_overflow,"bounded buffer lost overflow marker");
+    queue.Push(write);Require(queue.Take().size()==1,"buffer failed to resume after overflow");
+    fsengine::LinuxNotification overflow;overflow.overflow=true;queue.Push(overflow);batch=queue.Take();Require(batch.size()==1&&batch[0].overflow&&!batch[0].userspace_overflow,"kernel overflow origin lost");
+}
 int main() {
+    TestBufferedCollection();
     const auto named = Info(FAN_EVENT_INFO_TYPE_DFID_NAME, std::string("raw_") + char(255));
     const auto target = Info(FAN_EVENT_INFO_TYPE_FID);
     const auto good = Event(FAN_CREATE, {named, target});
