@@ -1,0 +1,19 @@
+# Generated builds, isolated compatibility caches, and live test outputs.
+build-windows-snapshot/
+addon-abi-*/
+addon-baseline-*/
+baseline-search-fixture-*/
+baseline-search-final-*/
+legacy-baseline.zip
+legacy-baseline-api.zip
+legacy-baseline-api/
+event-e2e/
+snapshot-limits-*/
+node-snapshot-*/
+windows_event_e2e.result.json
+baseline-search-abi*.result.txt
+merge-snapshot-*/
+merge-snapshot-*.result.txt
+windows_snapshot_live.result.txt
+windows_legacy_addon_baseline_dll.result.json
+windows_legacy_addon_new_dll.result.json

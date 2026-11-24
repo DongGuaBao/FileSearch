@@ -1,0 +1,18 @@
+BasedOnStyle: Microsoft
+TabWidth: 4
+UseTab: Never
+BreakBeforeBraces: Allman
+NamespaceIndentation: All
+SortIncludes: false
+AlignConsecutiveMacros: AcrossEmptyLinesAndComments
+ColumnLimit: 180
+SpaceBeforeParens: ControlStatements # 控制语句的括号前有空格
+SpaceBeforeAssignmentOperators: true # 赋值操作符前插入空格
+IndentWidth: 4 # 使用4个空格缩进
+MaxEmptyLinesToKeep: 1
+AlignTrailingComments: true
+SpacesBeforeTrailingComments: 1
+AlignEscapedNewlinesLeft: true
+# 允许将参数换行，但保持多个参数在同一行（打包参数）
+AllowAllParametersOfDeclarationOnNextLine: true
+BinPackParameters: true # 启用参数打包，减少换行次数

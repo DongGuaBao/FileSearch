@@ -1,0 +1,15 @@
+x64/
+New/
+.vs/
+cache/
+node_modules/
+build/
+obj/
+Release/
+Debug/
+*.user
+*.pdb
+*.ilk
+*.exp
+*.lib
+

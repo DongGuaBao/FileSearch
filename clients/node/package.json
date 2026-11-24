@@ -1,0 +1,9 @@
+{
+  "name": "filesearch-service-client",
+  "version": "0.1.0",
+  "main": "index.js",
+  "type": "commonjs",
+  "bin": { "filesearch": "cli.js" },
+  "engines": { "node": ">=18" },
+  "scripts": { "test": "node --test ../../tests/node_client_test.js ../../tests/node_cli_test.js" }
+}

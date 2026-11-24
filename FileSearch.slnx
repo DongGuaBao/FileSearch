@@ -1,0 +1,10 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="FileSearch.vcxproj" Id="91d06262-abae-4c2a-a509-a519f7794cc5" />
+  <Project Path="FileSearchCLI.vcxproj" Id="5d2a7e0d-e9b5-ca33-6735-f9ba818fcd9c" />
+  <Project Path="FileSearchService.vcxproj" Id="885b64fa-8e6b-4b6d-b925-a9a1e1c7856c" />
+  <Project Path="FileSearchTests.vcxproj" Id="31fcdfef-b1ab-4458-a822-a26c724ac4ca" />
+</Solution>

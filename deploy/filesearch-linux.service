@@ -1,0 +1,18 @@
+[Unit]
+Description=FileSearch Linux search and change stream
+After=local-fs.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+StateDirectory=filesearch
+StateDirectoryMode=0700
+UMask=0077
+ExecStart=/usr/local/bin/FileSearchServiceLinux / /var/lib/filesearch
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
